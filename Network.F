@@ -11,10 +11,12 @@
 \ format for easy copy/comparison with the respective fields in Ethernet/IP frames
 \ MAC and IP addresses are always referenced by pointer, never held on the stack
 
+\ The internet checksum routine assumes a cell size of not less that 32 bits
+
 \ Host data .........................................................................
 create inFrame 1518 allot					\ An incoming Ethernet frame
 create UDPframe 1518 allot					\ An outgoing UDP frame
-create ARPframe 1518 allot					\ an outgoing ARP frame
+create ARPframe 1518 allot					\ An outgoing ARP frame
 
 create hostMAC 6 allot						\ Host MAC address
 create hostIP 4 allot						\ Host IP address
@@ -130,6 +132,38 @@ decimal
 	drop -1
 ;
 
+: checksum ( addr n -- x)
+\ return the internet checksum for n bytes starting at addr
+\ routine adapted from https://tools.ietf.org/html/rfc1071
+	>R 0 swap			( 0 addr R:n)
+	
+	\ sum over 16 bit words in a 32 bit cell
+	BEGIN
+		R@ 1 >
+	WHILE
+		dup w@ 			( sum addr u)
+		rot + swap		( sum' addr)
+		2 +				( sum' addr')
+		R> 2 - >R		\ decrement n
+	REPEAT
+	
+	\ deal with any left over byte
+	R> IF C@ + ELSE drop THEN
+	
+	\ fold 32-bit sum into 16 bits
+	BEGIN				( sum)
+		dup 
+		16 Rshift dup	( sum sum>>16 sum>>16)
+	WHILE
+		swap 65535 and	( sum>>16 sumAND0xffff)
+		+
+	REPEAT
+		drop			( sum)
+	
+	\ invert 16 bit checksum
+	NOT 65535 and
+;
+
 \ Ethernet layer......................................................................
 
 create Ethernet.broadcast 255 c, 255 c, 255 c, 255 c, 255 c, 255 c,
@@ -161,7 +195,9 @@ create Ethernet.broadcast 255 c, 255 c, 255 c, 255 c, 255 c, 255 c,
 \ IP protocol handles an incoming datagram
 \ return the protocol of the IP frame or 0 either if the datagram does not meet assumptions
 \ or if the destination IP does not match the host IP
-	inFrame 								
+	inFrame 
+	\ include checksum check
+	\ include no fragments check
 	dup 14 + c@ 69 = 						\ version & IHL check
 	IF										\ IPv4 and no optional headers	
 		dup 30 + hostIP IP= 				\ destination IP check		
@@ -177,17 +213,18 @@ create Ethernet.broadcast 255 c, 255 c, 255 c, 255 c, 255 c, 255 c,
 \ The UDP segment of datagram will already have been completed by the caller of this routine
 \ complete the IP frame fields
 	UDPframe
-	dup 14 + 69 swap w!n					\ version and IHT
+	dup 14 + 69 swap c!						\ version and IHT
 	dup 15 + 0 swap c!						\ DS and ECN
 	dup 38 + w@n 20 +						\ retreive UDP.length and add 20 for IP header
 	over 16 + w!n							\ length
 	dup 18 + 0 swap w!						\ identification
 	dup 20 + 0 swap w!						\ flags and fragment offset
 	dup 22 + 64 swap c!						\ time to live
-	dup 23 + 17 swap w!n					\ protocol = 17 for UDP
+	dup 23 + 17 swap c!						\ protocol = 17 for UDP
 	dup 24 + 0 swap w!						\ initial value of checksum
-	\ hostIP over 26 + 4 move					\ copy in source IP address
-	\ swap over 30 + 4 move					\ copy in destination IP address
+	hostIP over 26 + 4 move					\ copy in source IP address
+	swap over 30 + 4 move					\ copy in destination IP address
+	dup 14 + 20 checksum swap 24 + w!		\ compute and save header checksum
 ;
 
 \ ARP layer ................................................................................
@@ -232,19 +269,45 @@ create ARP.cacheExpiry 1 cells 8 * allot
 	drop
 ;
 
-\ UDP layer ..................................................................................
+\ UDP FORTH terminal ............................................................................
+
+\ This minimal inplementation does not offer a generic API.  Instead there is a UDP Forth terminal
+\ Notes:
+\ The UDP destination port of incoming frames is ignored - all frames are forwarded to the buffer
+
+create UDPdestIP 4 allot			\ IP address of outgoing UDP frames
+variable UDPdestPort				\ Destination port of outgoing UDP frames
+
+: setUDPdestIP ( x0 x1 x2 x3 --)
+\ set the host IP address
+	hostIP dup 3 + DO i c! -1 +LOOP
+;
+
+: UEMIT ( c --)
+\ Place the character c in the outgoing UDP buffer.  Comments as for UTYPE
+;
+
+: UTYPE ( addr n --)
+\ Copy the string at addr of length n to the outgoing UDP buffer
+\ If the LF character is encountered then the UDP datagram, including the LF is transmitted
+\ The UDP datagram is also transmitted if the number of characters in the buffer exceeds the limit
+;
+
+: UKEY? ( -- flag)
+\ Return true if there is a character waiting in the incoming UDP buffer or false otherwise
+;
+
+: UKEY ( -- c)
+\ Return the next character from the incoming UDP buffer or block until one is available
+;
 
 : UDPin
 \ UDP protocol handles an incoming datagram
 ." UDP"
 ;
 
-\ Access routines ............................................................................
-
-: inLoop ( --)
-\ inLoop is a super-loop running in a separate process.  It handles incoming frames by passing 
-\ them to each protocol layer in turn.  There is no client/server model for each protocol layer 
-\ in this implementation
+: UDPterm ( --)
+\ UDPterm is a super-loop running in a separate process that handles incoming frames
 
 \	BEGIN
 		EthernetIn				( -- EthernetType)
@@ -264,6 +327,7 @@ create ARP.cacheExpiry 1 cells 8 * allot
 \	AGAIN
 ;
 
+
 \ Testing .................................................................................
 
 : parseFrame ( frame <FRAMESTRING> --)
@@ -280,7 +344,7 @@ create ARP.cacheExpiry 1 cells 8 * allot
 	rot dup rot + swap DO	
 		2 over c!			( caddr)			\ make a counted string of length 2
 		dup NUMBER?			
-		IF	i c! ELSE ." parse failed" abort THEN
+		IF	i c! ELSE CR ." parse failed" abort THEN
 		2+
 	LOOP
 	drop
@@ -300,7 +364,7 @@ create ARP.cacheExpiry 1 cells 8 * allot
 	LOOP
 ;
 
-: .EthernetFrame ( frame --)
+: .EthernetFields ( frame --)
 \ print the Ethernet fields in frame
 	CR ." Ethernet " CR
 	CR ." Destination MAC " dup .MAC
@@ -309,7 +373,7 @@ create ARP.cacheExpiry 1 cells 8 * allot
 	drop
 ;
 
-: .IPframe ( frame --)
+: .IPfields ( frame --)
 \ print all of the IP fields in frame
 	dup .EthernetFrame
 	CR ." IP "
@@ -326,7 +390,7 @@ create ARP.cacheExpiry 1 cells 8 * allot
 	drop
 ;
 
-: .UDPframe ( frame --)
+: .UDPfields ( frame --)
 \ Print all of the fields in frame
 	dup .IPframe
 	CR ." UDP "
