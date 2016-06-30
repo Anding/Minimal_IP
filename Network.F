@@ -1,7 +1,8 @@
 \ Mimimal UDP/IP stack 
 \ Andrew Read June 2016
 
-\ Implementation overview .........................................................
+\ ..............................................................................................................
+\ Implementation overview ......................................................................................
 \ This implementation does not queue frame.  We reserve space for a single incoming
 \ frame and a single frame for each top level protocol. Each must be completely
 \ processed before the next is created.  The in and out FIFO buffers provide a 
@@ -13,8 +14,9 @@
 
 \ The internet checksum routine assumes a cell size of not less that 32 bits
 
-\ Host data .........................................................................
-create inFrame 1518 allot					\ An incoming Ethernet frame
+\ ..............................................................................................................
+\ Host data ....................................................................................................
+create inFrame 1518 allot					\ An incoming Ethernet frame.  14 + 1500 + 4 bytes maximum
 create UDPframe 1518 allot					\ An outgoing UDP frame
 create ARPframe 1518 allot					\ An outgoing ARP frame
 
@@ -23,7 +25,12 @@ create hostIP 4 allot						\ Host IP address
 create subnet 4 allot						\ Host's local network subnet mask
 create router 4 allot						\ Host's local network router IP
 
-\ Hardware specific (N.I.G.E. Machine)................................................
+\ ARP chache is a simple array with space for 8 entries for
+\ IP address (4 bytes), MAC address (6 bytes), timestamp (4 bytes)
+create ARPcache 112 allot					\ 112 = 14 * 8
+
+\ ..............................................................................................................
+\ Hardware specific (N.I.G.E. Machine)..........................................................................
 hex
 03f860 constant MACreadyRX
 03f864 constant MACdataRX
@@ -35,26 +42,40 @@ decimal
 
 : getFrame ( -- ) 
 \ wait for an incoming Ethernet frame and place it into inFrame
-
 	BEGIN
 		\ wait for an incoming frame
 		BEGIN								
 			MACreadyRX @
 			pause
 		UNTIL		
-		
-		\ place the incoming frame from the FIFO buffer to local storage				
+		\ copy the incoming frame from the FIFO buffer to local storage				
 		inFrame dup 1518 + swap DO						\ maximum 1518 bytes of data may be copied
 			MACdataRX @ i c!
-			MACreadyRX @ 0= IF unloop exit THEN			\ ... but exit as soon as the FIFO is empty
+			MACreadyRX @ 0= IF LEAVE THEN				\ ... but exit as soon as the FIFO is empty
 		LOOP
-		
-		\ confirm checksum validity
-		MACchecksum_err @ not
+		MACchecksum_err @ not							\ confirm checksum validity
 	UNTIL
 ;
 
-\ Host configuration  ................................................................
+: putFrame ( frame len --)
+\ wait until MAC controller is free and then send the Ethernet frame of length len
+\ the Ethernet CRC checksum will be computed in hardware by the MAC controller 
+	
+	\ wait for any existing transmission to complete
+	BEGIN
+		MACreadyTX @
+		pause
+	UNTIL
+	\ transfer the frame to the FIFO buffer
+	over + swap DO
+		i C@ MACdataTX C!
+	LOOP
+	\ signal the MAC controller to transmit
+	0 MACtransmit_req !
+;	
+
+\ ..............................................................................................................
+\ Host configuration  ..........................................................................................
 
 : setMAC ( x0 x1 x2 x3 x4 x5 --)
 \ set the host MAC address
@@ -76,7 +97,12 @@ decimal
 	router dup 3 + DO i c! -1 +LOOP
 ;	
 
-\ Helper words ....................................................................
+\ ..............................................................................................................
+\ Helper words .................................................................................................
+
+create MACbroadcast 255 c, 255 c, 255 c, 255 c, 255 c, 255 c,
+create MACempty 00 c, 00 c, 00 c, 00 c, 00 c, 00 c,
+create ARPheader 00 c, 01 c, 08 c, 00 c, 06 c, 04 c, 
 
 : w@n ( addr -- x)
 \ read a 16 bit word in network endian format
@@ -132,6 +158,16 @@ decimal
 	drop -1
 ;
 
+: MAC= ( MAC1 MAC2 -- flag)
+\ compare two MAC addresses referenced by pointers
+	6 mem=
+;
+
+: IP=  ( IP1 IP2 -- flag)
+\ compare two IP addresses referenced by pointers
+	4 mem=
+;
+
 : checksum ( addr n -- x)
 \ return the internet checksum for n bytes starting at addr
 \ routine adapted from https://tools.ietf.org/html/rfc1071
@@ -164,54 +200,162 @@ decimal
 	NOT 65535 and
 ;
 
-\ Ethernet layer......................................................................
+\ ..............................................................................................................
+\ ARP protocol  ................................................................................................
 
-create Ethernet.broadcast 255 c, 255 c, 255 c, 255 c, 255 c, 255 c,
-\ the broadcast Ethernet address
-
-: MAC= ( MAC1 MAC2 -- flag)
-\ compare two MAC addresses referenced by pointers
-	6 mem=
+: Ethernet.dispatchARP ( MAC --)
+\ Dispatch the ARP protocol frame to Ethernet address MAC
+	ARPframe
+	dup -rot 6 move								\ copy in the Ethernet destination MAC address	
+	hostMAC over 6 + 6 move						\ copy in the Ethernet source MAC address
+	dup 12 + 2054 swap !n						\ set EthernetType = 0x0806
+	42											\ APR length of 28 plus 14 for Ethernet
+	( frame len) \ putframe
 ;
 
-: EthernetIn ( -- EthernetType)
-\ return the Ethernet type of inFrame or 0 if the frame either does not meet assumptions
-\ or if the destination does not match the host MAC / broadcast
-	inframe
-	dup hostMAC MAC= 							\ destination MAC = host MAC
-	over Ethernet.broadcast MAC=  or			\ destination MAC = broadcast
-	IF 12 + w@n								\ read Ethernet type
-	ELSE drop 0	THEN
+: ARP.initCache ( --)
+\ initialize the ARP cache
+	ARPcache 112 blank				\ zero the cache memory
+	timer							( timestamp)	
+	ARPcache dup 112 + swap DO		\ timestamp all cache slots with the current time
+		dup i 10 + !
+	14 +LOOP drop
 ;
 
-\ IP layer ..............................................................................
+: ARP.lookupIP ( IP -- addr flags) 
+\ lookup IP in cache.  Returns flags and addr as follows
+\  0  : IP not found. Address addr can be used to hold this IP entry
+\  1  : partial IP (no MAC) entry available at address addr
+\ -1  : complete IP/MAC entry available at address addr
 
-: IP=  ( IP1 IP2 -- flag)
-\ compare two IP addresses referenced by pointers
-	4 mem=
-;
-
-: IPin ( -- protocol)
-\ IP protocol handles an incoming datagram
-\ return the protocol of the IP frame or 0 either if the datagram does not meet assumptions
-\ or if the destination IP does not match the host IP
-	inFrame 
-	\ include checksum check
-	\ include no fragments check
-	dup 14 + c@ 69 = 						\ version & IHL check
-	IF										\ IPv4 and no optional headers	
-		dup 30 + hostIP IP= 				\ destination IP check		
-		IF									
-			23 + c@	EXIT					\ retreive IP protocol			
+	\ search the ARPchache for this IP address
+	0
+	ARPcache dup 112 + swap DO
+		dup i IP=
+		IF drop i LEAVE THEN		\ IP address found, replace 0 with the pointer to the entry
+	14 +LOOP
+	
+	( 0 | addr) dup IF				\ if IP was found, now check the MAC field		
+		dup 4 + MACempty MAC= IF			
+			1 exit					\ MAC address is zero - this is a partial entry		
+		ELSE
+			\ check the timestamp
+			-1 exit					\ MAC address is not zero - this is a complete entry
 		THEN
+	ELSE							\ if IP not found, find the Least Recently Used (LRU) cache entry
+		ARPcache swap 				\ for now, just return the first slot	
 	THEN
-	drop 0
+;	
+
+: ARP.updateCache ( --)
+\ Updates the ARP cache by reference to an ARP reply or request received from the network
+\ assumes that inFrame is the incoming ARP frame
+	inFrame 22 + ARP.lookupIP  					( addr flags)  \ lookup sender's IP
+	0= IF inFrame 22 + over 4 move THEN			\ copy sender's IP address if this is a new entry
+	inFrame 28 + over 4 + 6 move				\ copy sender's MAC address
+	10 + timer swap !							\ timestamp the chache entry
 ;
 
-: IPout_UDP ( IP --)
-\ dispatch a UDP datagram to an IP address referenced at IP
-\ The UDP segment of datagram will already have been completed by the caller of this routine
-\ complete the IP frame fields
+: ARP.request ( IP --)
+\ create and send an ARP request WhoIs? IP
+	ARPframe
+	ARPheader over 14 + 6 move					\ copy in the ARP header
+	dup 20 + 1 swap w!n							\ opcode 1 is an ARP request
+	hostMAC over 22 + 6 move					\ copy in sender's (i.e. host) MAC
+	hostIP over 28 + 4 move						\ copy in sender's IP
+	dup 32 + 6 blank							\ zeros for target MAC
+	38 + 4 move									\ copy in target IP
+	MACbroadcast								\ destination MAC will be broadcast
+	( broadcastMAC) Ethernet.dispatchARP
+;
+
+: ARP.gratuitous
+\ make a gratuitous ARP request for the host's own IP
+	hostIP ARP.request
+;
+
+: ARP.reply ( --)
+\ create an ARP reply in reponse to a ARP request and dispatch via the Ethernet layer
+	ARPframe
+	ARPheader over 14 + 6 move					\ copy in the ARP header
+	dup 20 + 2 swap w!n							\ opcode 2 is an ARP reply
+	hostMAC over 22 + 6 move					\ copy in sender's (i.e. host) MAC
+	hostIP over 28 + 4 move						\ copy in sender's IP
+	InFrame 22 + over 32 + 10 move				\ copy the sender fields from the ARP request 
+												\ 	to the target fields of the ARP reply
+	32 + 										\ destination MAC will be the target MAC
+	( targetMAC) Ethernet.dispatchARP
+;
+
+: ARP.getMAC ( IP -- MAC true | false) 
+\ obtain the MAC address of an IP address, making ARP requests if necessary
+\ return MAC true if successful or false if a MAC address cannot be obtained
+	4 0 DO										\ allow initial cache lookup plus three ARP request attempts
+		dup ARP.lookupARP						\ loopup the IP address in the ARP cache
+		-1 = IF 								\ a complete entry is available
+			4 + -1 EXIT							\ reference the MAC address and exit true
+		THEN
+		dup ARP.request							\ initiate an ARP request for this IP address
+		i IF 10000 ELSE 1000 THEN ms			\ allow time for the ARP layer (1 sec initially, then 10 secs)
+	LOOP
+	drop 0										\ failed to obtain a MAC address
+;
+
+: ARP.in ( --)
+\ ARP protocol handles an incoming frame from the network
+	inFrame
+	dup 14 + ARP.ExpectedHeader 6 mem= 			\ confirm the expected ARP header
+	IF
+		dup 20 + w@n							\ retrieve ARP opcode
+		CASE
+			1 OF 								\ it is an ARP request
+				dup 38 + hostIP IP=	IF			\ does target IP = host IP ?
+					ARP.updateCache
+					ARP.sendReply
+				ENDIF
+			ENDOF
+			2 OF								\ it is an ARP reply
+				dup 28 + hostIP IP= IF			\ does sender IP = host IP ?
+					." IP conflict"
+				ELSE
+					ARP.updateCache
+				THEN
+			ENDOF
+		ENDCASE
+	THEN
+	drop
+;
+
+\ ..............................................................................................................
+\ Frames received from the protocol stack are passed to the network.............................................
+
+: Ethernet.dispatchIP ( frame MAC --)
+\ Dispatch an IP datagram to Ethernet address MAC
+	swap
+	hostMAC over 6 + 6 move						\ set the source MAC address
+	dup 12 + 2048 swap !n						\ set the EthernetType = 0x0800
+	dup -rot 6 move								\ set the destination MAC address
+	dup 16 + w@n 14 +							\ retrieve IP length and add 14 for Ethernet
+	( frame len) \ putfame
+;
+
+: IP.forward ( frame --)
+\ Forward an IP frame via direct delivery or indirect delivery
+	subnet !n								( frame subnet)
+	over 30 + !n							( frame subnet destIP)
+	over and >R								( frame subnet R:destNET)
+	hostIP !n and R>						( frame hostNET destNET)
+	= IF									\ are destination and host on same subnet?
+		dup 30 + ARP.getMAC					\ direct delivery to the MAC of destination IP
+	ELSE
+		router ARP.getMAC					\ indirect delivery to router
+	THEN
+	( frame MAC true | false) IF Ethernet.dispatchIP ELSE drop THEN
+;
+
+: IP.dispatchUDP ( IP --)
+\ Prepare an IP frame starting from the UDP frame and then dispatch via IP forwarding
+\ The UDP segment of datagram will already have been completed by the caller
 	UDPframe
 	dup 14 + 69 swap c!						\ version and IHT
 	dup 15 + 0 swap c!						\ DS and ECN
@@ -225,48 +369,74 @@ create Ethernet.broadcast 255 c, 255 c, 255 c, 255 c, 255 c, 255 c,
 	hostIP over 26 + 4 move					\ copy in source IP address
 	swap over 30 + 4 move					\ copy in destination IP address
 	dup 14 + 20 checksum swap 24 + w!		\ compute and save header checksum
+	( UDPframe) IP.forward
 ;
 
-\ ARP layer ................................................................................
+\ ..............................................................................................................
+\ Frames received from the network are passed up the protocol stack.............................................
 
-create ARP.ExpectedHeader 00 c, 01 c, 08 c, 00 c, 06 c, 04 c, 
-\ Expected format of an Ethernet/IP ARP header
-
-\ ARP chache is a simple array with space for 8 entries
-create ARP.cacheMAC	6 8 * allot
-create APR.cacheIP 4 8 * allot
-create ARP.cacheExpiry 1 cells 8 * allot
-
-: ARP.MACtoIP ( MAC -- IP) 
-\ accept a MAC address (as a pointer) and return the IP address (as a pointer), or 0 if unavailable
-\ If unavailable an ARP request will automatically be made
+: UDPin
+\ Receive a UDP frame from the IP layer
+	." UDP"
 ;
 
-: ARP.updateCache ( --)
-\ assumes that inFrame is an ARP reply or APR request and updates the ARP cache for the sender's MAC and IP
-;
-
-: ARPin
-\ ARP protocol handles an incoming frame
-	." ARP"
-	inFrame
-	dup 14 + ARP.ExpectedHeader 6 mem= 			\ confirm the expected ARP header
-	IF
-		dup 20 + w@n							\ retrieve ARP opcode
-		CASE
-			1 OF 								\ is ARP request
-				dup 38 + hostIP IP=				\ target IP = host IP
-				IF
-					dup ARP.updateCache
-					\ dispatch reply
-				ENDIF
-			ENDOF
-			2 OF									\ is ARP reply
-				dup ARP.updateCache
-			ENDOF
-		ENDCASE
+: IP.check ( -- protocol)
+\ Check an IP frame.  If the datagram does not meet assumptions or the destination IP does not match the 
+\ host IP, return 0.  If the datagram is good, return the protocol
+	inFrame 
+	\ include checksum check
+	\ include no fragments check
+	dup 14 + c@ 69 = 						\ confirm version = IPv4 and no optional headers
+	IF										 	
+		dup 30 + hostIP IP= 				\ confirm destination IP = host IP		
+		IF									
+			23 + c@	EXIT					\ retreive IP protocol			
+		THEN
 	THEN
-	drop
+	drop 0
+;
+	
+: IP.in  ( --)
+\ Receive an IP frame from the Ethernet layer
+\ Check the frame and pass it up the protocol stack
+	IP.check
+	CASE
+		17 OF		\ 0x11 is a UDP datagram
+			UDP.in
+		ENDOF
+	ENDCASE
+	\ all other datagrams silently dropped
+;
+
+: Ethernet.check ( -- EthernetType)
+\ Check an Ethernet frame. If the frame either does not meet assumptions or if the destination does not match the 
+\ host MAC / broadcast, return 0. Is the frame is good, return the EthernetType
+	inframe
+	dup hostMAC MAC= 							\ destination MAC = host MAC
+	over Ethernet.broadcast MAC=  or			\ destination MAC = broadcast
+	IF 12 + w@n									\ read Ethernet type
+	ELSE drop 0	THEN
+;
+
+: Ethernet.in ( --)
+\ Receive an IP frame form the MAC controller and pass it up the protocol stack
+	Ethernet.check ( -- EthernetType)
+	CASE
+		2054 OF				\ 0x0806 is an ARP frame
+			ARP.in			( --)
+		ENDOF
+		2048 OF				\ 0x0800 is an IP frame
+			IP.in			( -- protocol type)
+		ENDOF
+	ENDCASE					\ all other frames / datagrams are silently discarded
+;
+
+: EthernetReceiveTask ( --)
+\ super-loop running as a separate task that handles incoming frames
+	BEGIN
+		getFrame
+		Ethernet.in
+	AGAIN
 ;
 
 \ UDP FORTH terminal ............................................................................
@@ -300,33 +470,6 @@ variable UDPdestPort				\ Destination port of outgoing UDP frames
 : UKEY ( -- c)
 \ Return the next character from the incoming UDP buffer or block until one is available
 ;
-
-: UDPin
-\ UDP protocol handles an incoming datagram
-." UDP"
-;
-
-: UDPterm ( --)
-\ UDPterm is a super-loop running in a separate process that handles incoming frames
-
-\	BEGIN
-		EthernetIn				( -- EthernetType)
-		CASE
-			2054 OF				\ 0x0806 is an ARP frame
-				ARPin			( --)
-			ENDOF
-			2048 OF				\ 0x0800 is an IP frame
-				IPin			( -- protocol type)
-				CASE
-					17 OF		\ 0x11 is a UDP datagram
-						UDPin
-					ENDOF
-				ENDCASE
-			ENDOF
-		ENDCASE					\ all other frames / datagrams are silently discarded
-\	AGAIN
-;
-
 
 \ Testing .................................................................................
 
