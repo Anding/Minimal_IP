@@ -13,7 +13,15 @@
 \ the Ethernet CRC checksum will be computed in hardware by the MAC controller 
 	drop drop
 ;
-	
+
+: ACQUIRE ( semaphore --)
+	drop
+;
+
+: RELEASE ( sempahore --)
+	drop
+;
+		
 \ ..............................................................................................................
 \ Debugging ....................................................................................................
 

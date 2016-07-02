@@ -38,51 +38,25 @@ create MACbroadcast 255 c, 255 c, 255 c, 255 c, 255 c, 255 c,
 create MACempty 00 c, 00 c, 00 c, 00 c, 00 c, 00 c,
 create ARPheader 00 c, 01 c, 08 c, 00 c, 06 c, 04 c, 
 
-: w@n ( addr -- x)
+variable endian 0 endian !
+	endian 1 over c! dup w@ 1 AND 1- swap !
+\ endian @ returns TRUE for big endian and 0 for little endian
+
+: w@n ( addr -- u)
 \ read a 16 bit word in network endian format
-
-\ this word can be used on both big and little endian machines.  It deals with
-\ (1) byte reversal for little endian machines and (2) misaligned access
-\ N.I.G.E. is a big endian machine that supports misaligned access in SRAM
-\ Simply use w@ on the N.I.G.E.
-
-	0 swap				( 0 addr)			
-	dup 2 + swap DO		
-		256 * i c@ or
-	LOOP
+\ this word can be used on both big and little endian machines. 
+\ alternatively on big endian machines, simply use w@
+	dup c@ 256 *		( addr hh00)	\ high byte in network endian
+	swap 1+ c@ +		( hhll)			\ low byte
 ;
 
-: w!n ( x addr --)
+: w!n ( u addr --)
 \ write a 16 bit word in network endian format
-
-\ this word can be used on both big and little endian machines.  It deals with
-\ (1) byte reversal for little endian machines and (2) misaligned access
-\ N.I.G.E. is a big endian machine that supports misaligned access in SRAM
-\ Simply use w! on the N.I.G.E.
-
-	dup 1 + DO
-		dup 255 and i c!
-		8 rshift
-	-1 +LOOP
-	drop
+\ this word can be used on both big and little endian machines. 
+\ alternatively on big endian machines, simply use w!
+	over 8 rshift over c!
+	1 + c!
 ;
-
-: @n ( addr -- x)
-\ read a 32 bit longword in network endian format
-	0 swap				( 0 addr)			
-	dup 4 + swap DO		
-		256 * i c@ or
-	LOOP
-;
-
-: !n ( addr x --)
-\ write a 32 bit longword in network endian format
-	dup 3 + DO
-		dup 255 and i c!
-		8 rshift
-	-1 +LOOP
-	drop
-;	
 
 : mem= ( addr1 addr2 n -- flag)
 \ compare n bytes of data at two memory locations
@@ -103,37 +77,71 @@ create ARPheader 00 c, 01 c, 08 c, 00 c, 06 c, 04 c,
 	4 mem=
 ;
 
+: checksum-add ( sum addr n -- sum)
+\ Sum over 16 bit words in a 32 bit cell and accumulate to sum.
+\ Checksum calculations are performed in the natural endian of the machine for speed.
+\ Hence need to check machine endian to deal with any odd byte
+	\ sum over complete words
+	>R BEGIN				( sum addr R:n)
+		R@ 1 >
+	WHILE
+		dup w@ 				( sum addr u)
+		rot + swap			( sum' addr)
+		2 +					( sum' addr')
+		R> 2 - >R			\ decrement n
+	REPEAT R>				( sum addr 0|1)
+	\ deal with any left over byte
+	IF C@ endian @ IF 256 * THEN +
+	ELSE drop THEN	( sum)
+;
+
+: checksum-add&move ( sum src dst n -- sum)
+\ as checksum-add but move the data from src to dst at the same time
+	\ sum over complete words
+	swap >R >R BEGIN		( sum src R:dst n)
+		R@ 1 >
+	WHILE
+		dup w@				( sum src u R:dst n)		\ read the word
+		R> 2 - -rot			( sum n' src u R:dst)		\ decrement n
+		R> over over w! 	( sum n' src u dst)			\ copy the word to dst
+		2 + >R rot >R		( sum src u R:dst' n)		\ increment dst
+		rot + swap			( sum' src R:dst' n)		\ accumulate to sum
+		2 +					( sum' src' R:dst' n)		\ increment src
+	REPEAT R> 				( sum addr 0|1 R:dst)
+	\ deal with any left over byte
+	IF
+		c@ dup R> c!		( sum u)					\ copy the byte to dst
+		endian @ IF 256 * THEN
+		+					( sum)						\ accumulate to sum
+	ELSE 
+		R> drop drop 
+	THEN					( sum)
+;
+
+: checksum-fold ( sum -- checksum)
+\ fold the accumulated carry in a 32 bit-cell back into the 16 bit sum
+	BEGIN					( sum)
+		dup 
+		16 Rshift dup		( sum sum>>16 sum>>16)
+	WHILE
+		swap 65535 and		( sum>>16 sumAND0xffff)
+		+
+	REPEAT
+		drop				( sum)
+	\ invert 16 bit checksum
+	NOT 65535 and			( x)
+	\ 0x0000 and 0xffff both stand for 0 in ones's complement: exchange the latter for the former
+	dup 65535 = IF drop 0 THEN
+;
+
 : checksum ( addr n -- x)
 \ return the internet checksum for n bytes starting at addr
 \ routine adapted from https://tools.ietf.org/html/rfc1071
-	>R 0 swap			( 0 addr R:n)
-	
-	\ sum over 16 bit words in a 32 bit cell
-	BEGIN
-		R@ 1 >
-	WHILE
-		dup w@ 			( sum addr u)
-		rot + swap		( sum' addr)
-		2 +				( sum' addr')
-		R> 2 - >R		\ decrement n
-	REPEAT
-	
-	\ deal with any left over byte
-	R> IF C@ + ELSE drop THEN
-	
-	\ fold 32-bit sum into 16 bits
-	BEGIN				( sum)
-		dup 
-		16 Rshift dup	( sum sum>>16 sum>>16)
-	WHILE
-		swap 65535 and	( sum>>16 sumAND0xffff)
-		+
-	REPEAT
-		drop			( sum)
-	
-	\ invert 16 bit checksum
-	NOT 65535 and
+	0 -rot					( 0 addr n)
+	checksum-add
+	checksum-fold
 ;
+
 \ ..............................................................................................................
 \ Debugging  ...................................................................................................
 
@@ -379,7 +387,7 @@ create ARPheader 00 c, 01 c, 08 c, 00 c, 06 c, 04 c,
 \ Dispatch an IP datagram to Ethernet address MAC
 	swap
 	hostMAC over 6 + 6 move						\ set the source MAC address
-	dup 12 + 2048 swap w!n						\ set the EthernetType = 0x0800
+	2048 over 12 + w!n					 		\ set the EthernetType = 0x0800
 	dup -rot 6 move								\ set the destination MAC address
 	dup 16 + w@n 14 +							\ retrieve IP length and add 14 for Ethernet
 	( frame len) putframe
@@ -406,18 +414,18 @@ create ARPheader 00 c, 01 c, 08 c, 00 c, 06 c, 04 c,
 \ Prepare an IP frame starting from the UDP frame and then dispatch via IP forwarding
 \ The UDP segment of datagram will already have been completed by the caller
 	UDPframe
-	dup 14 + 69 swap c!						\ version and IHT
-	dup 15 + 0 swap c!						\ DS and ECN
-	dup 38 + w@n 20 +						\ retreive UDP.length and add 20 for IP header
-	over 16 + w!n							\ length
-	dup 18 + 0 swap w!						\ identification
-	dup 20 + 0 swap w!						\ flags and fragment offset
-	dup 22 + 64 swap c!						\ time to live
-	dup 23 + 17 swap c!						\ protocol = 17 for UDP
-	dup 24 + 0 swap w!						\ initial value of checksum
-	hostIP over 26 + 4 move					\ copy in source IP address
-	swap over 30 + 4 move					\ copy in destination IP address
-	dup 14 + 20 checksum over 24 + w!		\ compute and save header checksum
+	69 over 14 + c!						\ version and IHT
+	 0 over 15 + c!						\ DS and ECN
+	dup 38 + w@n 20 +					\ retreive UDP.length and add 20 for IP header
+	over 16 + w!n						\ length
+	ticks over 18 + w!n					\ identification - need to change each packet
+	 0 over 20 + w!						\ flags and fragment offset
+	64 over 22 + c!						\ time to live
+	17 over 23 + c!						\ protocol = 17 for UDP
+	 0 over 24 + w!						\ initial value of checksum
+	hostIP over 26 + 4 move				\ copy in source IP address
+	swap over 30 + 4 move				\ copy in destination IP address
+	dup 14 + 20 checksum over 24 + w!	\ compute and save header checksum
 	( UDPframe) IP.forward
 ;
 
@@ -439,12 +447,23 @@ variable UDPsrcPort					\ Source port of outgoing UDP frames
 
 : UDP.send ( addr n --)
 \ send n characters at address addr by UDP
-	UDPframe
+	\ prepare UDP fields
+	UDPframe							( addr n frame)
 	UDPsrcPort w@ over 34 + w!n
 	UDPdestPort w@ over 36 +  w!n
-	over 8 + over 38 + w!n				\ length including 8 byte header
-	0 over 28 + w!						\ checksum
-	42 + swap move						\ copy data into UDP frame
+	over 8 + over 38 + w!n				\ add 8 bytes of header to compute UDP size
+	0 over 40 + w!						\ zero checksum field initially	
+	\ compute checksum starting with the UDP-pseudo header 				
+	0 hostIP 4 checksum-add				( addr n frame sum)
+	UDPdestIP 4 checksum-add			
+	17 endian @ 0= IF 256 * THEN +		\ protocol byte
+	over 38 + w@ +						\ UDP length
+	over 34 + 8 checksum-add			\ accumulate true UDP header
+										( src n frame sum)
+	swap >R	-rot R@ 42 + swap			( sum src dest n R:frame)
+	checksum-add&move					( sum R:frame)
+	checksum-fold						( sum R:frame)
+	R> 40 + w!							\ write the checksum field
 	UDPdestIP IP.dispatchUDP
 ;
 
@@ -469,6 +488,27 @@ variable UDPsrcPort					\ Source port of outgoing UDP frames
 \ ..............................................................................................................
 \ Frames received from the network are passed up the protocol stack.............................................
 
+: UDP.checksum ( -- checksum)
+\ return the checksum of a UDP frame within an IP frame
+	\ start with the UDP-pseudo header 		
+	UDPframe
+	0 over 26 + 8 checksum-add					\ IP addresses	
+	17 endian @ 0= IF 256 * THEN +				\ protocol byte
+	over 38 + w@ +								\ UDP length
+	\ UDP header and frame	
+	over dup 38 + w@n swap 34 + swap 			( frame sum addr n)
+	checksum-add checksum-fold nip
+;
+
+: UDP.check ( -- destPort)
+\ Check an UDP frame. If the checksum is invalid, return 0
+\ otherwise return the destination port
+	UDPframe 
+	dup UDP.checksum 0= IF
+		36 + w@n
+	ELSE drop 0 THEN
+;
+	
 : UDP.in
 \ Receive a UDP frame from the IP layer
 	CR ." UDP"
