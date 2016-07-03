@@ -2,17 +2,32 @@
 \ Andrew Read June 2016
 
 \ ..............................................................................................................
-\ Implementation overview ......................................................................................
-\ This implementation does not queue frame.  We reserve space for a single incoming
-\ frame and a single frame for each top level protocol. Each must be completely
-\ processed before the next is created.  The in and out FIFO buffers provide a 
-\ buffer of one frame between the harware MAC controller and this software
+\ Description ..................................................................................................
+\ This is a "minimal" implementaton of a UDP/IP stack. UDP, IP and ARP are implemented except as noted below
+\ The code is designed for the N.I.G.E. Machine but should be suitable for other systems that have
+\ (a) multitasking (we require two tasks)
+\ (b) ANSI Forth
+\ (c) an Ethernet MAC controller (accessed via the functions below)
+\
+\ ticks ( -- ms, provide the system timer counter values in milliseconds)
+\ getFrame ( frame -- , wait for an incoming Ethernet frame and copy it to frame)
+\ putFrame ( frame len -- , send the Ethernet frame of length len to the MAC controller)
+\ 	we assume that the Ethernet CRC checksum will be computed in hardware by the MAC controller 
 
-\ MAC and IP addresses are stored as a sequence of bytes in network (big) endian
-\ format for easy copy/comparison with the respective fields in Ethernet/IP frames
-\ MAC and IP addresses are always referenced by pointer, never held on the stack
+\ The Forth system assesses the UDP/IP stack with the words UDP.send and UDP.in (see the code).  Otherwise there
+\ are no generic 'sockets' or API. Words are provided for datagram inspection, etc..  See the section 'debugging'
+\ Features not implemented (among other): ICMP, DHCP, IP loopback (127.x.x.x), IP fragmentation
 
-\ The internet checksum routine assumes a cell size of not less that 32 bits
+\ ..............................................................................................................
+\ Implementation notes... ......................................................................................
+\ 1.This implementation is multitasking but it is not based on the client server model.  There are two tasks,
+\ one to handle incoming frames (all the way up the protocol stack) and one to handle outgoing frames (all the
+\ way down the protocol stack).  Each incoming / outgoing frame must be completely processed before the next.
+\ 2. We reserve space for a single incoming frame and a single frame for each top level protocol (UDP, ARP)
+\ The MAC controller FIFO buffers provide an additional buffer of one frame in each direction
+\ 3. MAC and IP addresses are stored as a sequence of bytes in network (big) endian. They are always referenced by 
+\ pointer never held on the stack
+\ 4. The internet checksum routine assumes a cell size of not less that 32 bits
 
 decimal
 \ ..............................................................................................................
@@ -38,9 +53,8 @@ create MACbroadcast 255 c, 255 c, 255 c, 255 c, 255 c, 255 c,
 create MACempty 00 c, 00 c, 00 c, 00 c, 00 c, 00 c,
 create ARPheader 00 c, 01 c, 08 c, 00 c, 06 c, 04 c, 
 
-variable endian 0 endian !
-	endian 1 over c! dup w@ 1 AND 1- swap !
-\ endian @ returns TRUE for big endian and 0 for little endian
+arpcache 0 over ! 1 over c! w@ 1 AND 1-		( 0 | -1)				\ use ARPcache as a scratch
+constant endian	\ endian returns TRUE on a big endian machine and FALSE on a little endian machine
 
 : w@n ( addr -- u)
 \ read a 16 bit word in network endian format
@@ -91,7 +105,7 @@ variable endian 0 endian !
 		R> 2 - >R			\ decrement n
 	REPEAT R>				( sum addr 0|1)
 	\ deal with any left over byte
-	IF C@ endian @ IF 256 * THEN +
+	IF C@ endian IF 256 * THEN +
 	ELSE drop THEN	( sum)
 ;
 
@@ -111,7 +125,7 @@ variable endian 0 endian !
 	\ deal with any left over byte
 	IF
 		c@ dup R> c!		( sum u)					\ copy the byte to dst
-		endian @ IF 256 * THEN
+		endian IF 256 * THEN
 		+					( sum)						\ accumulate to sum
 	ELSE 
 		R> drop drop 
@@ -209,7 +223,8 @@ variable endian 0 endian !
 	drop
 ;
 
-: .ARPcache
+: .ARPcache ( --)
+\ Print the ARP cache in the format IP, MAC, timestamp
 	ARPcache dup 112 + swap DO
 		CR i .IP 9 emit i 4 + .MAC 9 emit i 10 + @ u.
 	14 +LOOP
@@ -240,6 +255,8 @@ variable endian 0 endian !
 
 \ ..............................................................................................................
 \ ARP protocol  ................................................................................................
+\ Note ARP can be accessed by both the process receiving frames and the process sending frames
+\ Therefore always mediate access with ACQUIRE and RELEASE ARPsemaphore
 
 : Ethernet.dispatchARP ( MAC --)
 \ Dispatch the ARP protocol frame to Ethernet address MAC
@@ -342,17 +359,13 @@ variable endian 0 endian !
 ;
 
 : ARP.getMAC ( IP -- MAC true | false) 
-\ obtain the MAC address of an IP address, making ARP requests if necessary
-\ return MAC true if successful or false if a MAC address cannot be obtained
-	4 0 DO										\ allow initial cache lookup plus three ARP request attempts
-		dup ARP.lookupIP	( IP addr flags)	\ loopup the IP address in the ARP cache
-		-1 = IF 								\ a complete entry is available
-			nip 4 + -1 UNLOOP EXIT				\ reference the MAC address and exit true
-		ELSE drop THEN
-		dup ARP.request							\ initiate an ARP request for this IP address
-		i IF 10000 ELSE 1000 THEN ms			\ allow time for the ARP layer (1 sec initially, then 10 secs)
-	LOOP
-	drop 0										\ failed to obtain a MAC address
+\ obtain the MAC address of an IP address return MAC true if successful, 
+\ or if a MAC address cannot be obtained make an asynchronous ARP request and exit false
+	dup ARP.lookupIP -1 = IF 				\ Only recognize complete entries (i.e. -1, not 1 or 0)
+		nip 4 + -1							\ reference the MAC address and signal true
+	ELSE 
+		drop ARP.request	0 				\ No MAC address available - do APR request
+	THEN																		
 ;
 
 : ARP.in ( --)
@@ -393,6 +406,19 @@ variable endian 0 endian !
 	( frame len) putframe
 ;
 
+: IP.enquireARP ( IP -- MAC true | false) 
+\ repeatedly try to obtain the MAC address of an IP address by contacting the ARP 
+\ return MAC true if successful or false if a MAC address cannot be obtained
+	2 0 DO										\ allow initial cache lookup plus two ARP request attempts
+		ARPsemaphore ACQUIRE
+			dup ARP.getMAC	( IP, MAC true | false) \ request ARP for this IP address
+		ARPsemaphore RELEASE					\ important to RELEASE so ARP can handle incoming ARP replies
+		IF nip -1 UNLOOP EXIT THEN				\ MAC found, exit TRUE
+		i IF 1500 ELSE 500 THEN ms				\ allow time for the ARP request (0.5 sec initially, then 1.5 sec)
+	LOOP
+	drop 0										\ failed to obtain a MAC address
+;
+
 : IP.forward ( frame --)
 \ Forward an IP frame via direct delivery or indirect delivery
 	subnet @								( frame subnet)
@@ -404,9 +430,7 @@ variable endian 0 endian !
 	ELSE
 		router								\ indirect delivery to router
 	THEN
-	ARPsemaphore ACQUIRE
-		ARP.getMAC		( --)
-	ARPsemaphore RELEASE
+	( frame IP ) IP.enquireARP
 	( frame MAC true | false)  IF Ethernet.dispatchIP ELSE drop THEN
 ;
 
@@ -432,13 +456,9 @@ variable endian 0 endian !
 \ ..............................................................................................................
 \ UDP FORTH terminal ...........................................................................................
 
-\ This minimal inplementation does not offer a generic API.  Instead there is a UDP Forth terminal
-\ Notes:
-\ The UDP destination port of incoming frames is ignored - all frames are forwarded to the buffer
-
-create UDPdestIP 4 allot			\ IP address of outgoing UDP frames
-variable UDPdestPort				\ Destination port of outgoing UDP frames
-variable UDPsrcPort					\ Source port of outgoing UDP frames
+create UDPdestIP 4 allot			\ IP address for outgoing UDP frames
+variable UDPdestPort				\ Destination port of outgoing UDP frames. Word length. MUST USE W@ / W!
+variable UDPsrcPort					\ Source port of outgoing UDP frames. Word lenght. MUST USE W@ / W!
 
 : setUDPdestIP ( x0 x1 x2 x3 --)
 \ set the host IP address
@@ -456,7 +476,7 @@ variable UDPsrcPort					\ Source port of outgoing UDP frames
 	\ compute checksum starting with the UDP-pseudo header 				
 	0 hostIP 4 checksum-add				( addr n frame sum)
 	UDPdestIP 4 checksum-add			
-	17 endian @ 0= IF 256 * THEN +		\ protocol byte
+	17 endian 0= IF 256 * THEN +		\ protocol byte
 	over 38 + w@ +						\ UDP length
 	over 34 + 8 checksum-add			\ accumulate true UDP header
 										( src n frame sum)
@@ -467,33 +487,11 @@ variable UDPsrcPort					\ Source port of outgoing UDP frames
 	UDPdestIP IP.dispatchUDP
 ;
 
-: UEMIT ( c --)
-\ Place the character c in the outgoing UDP buffer.  Comments as for UTYPE
-;
-
-: UTYPE ( addr n --)
-\ Copy the string at addr of length n to the outgoing UDP buffer
-\ If the LF character is encountered then the UDP datagram, including the LF is transmitted
-\ The UDP datagram is also transmitted if the number of characters in the buffer exceeds the limit
-;
-
-: UKEY? ( -- flag)
-\ Return true if there is a character waiting in the incoming UDP buffer or false otherwise
-;
-
-: UKEY ( -- c)
-\ Return the next character from the incoming UDP buffer or block until one is available
-;
-
-\ ..............................................................................................................
-\ Frames received from the network are passed up the protocol stack.............................................
-
-: UDP.checksum ( -- checksum)
+: UDP.checksum ( frame -- checksum)
 \ return the checksum of a UDP frame within an IP frame
 	\ start with the UDP-pseudo header 		
-	UDPframe
 	0 over 26 + 8 checksum-add					\ IP addresses	
-	17 endian @ 0= IF 256 * THEN +				\ protocol byte
+	17 endian 0= IF 256 * THEN +				\ protocol byte
 	over 38 + w@ +								\ UDP length
 	\ UDP header and frame	
 	over dup 38 + w@n swap 34 + swap 			( frame sum addr n)
@@ -503,25 +501,30 @@ variable UDPsrcPort					\ Source port of outgoing UDP frames
 : UDP.check ( -- destPort)
 \ Check an UDP frame. If the checksum is invalid, return 0
 \ otherwise return the destination port
-	UDPframe 
+	inframe 
 	dup UDP.checksum 0= IF
 		36 + w@n
 	ELSE drop 0 THEN
 ;
 	
-: UDP.in
+: UDP.in ( --)
 \ Receive a UDP frame from the IP layer
-	CR ." UDP"
-	inframe 
-	dup 36 + w@n 						( frame destPort)
-	\ ." to port" dup .
-	5000 = IF							\ listen on port 5000
-		dup 42 + over 38 + w@n 8 - 			( frame addr n)
-		over over CR type CR				\ type the contents
-		drop drop \ UDP.send							\ echo
+	UDP.check	( -- destport | 0)		\ validate checksum
+	
+	\ ************************************************
+	\ adapt code from here for the intended applicaton
+	?dup IF
+		CR ." UDP to port " dup .
+		UDPsrcPort w@ = IF				\ incoming destPort = local scrPort ?
+			inframe dup 42 + over 38 + w@n 8 - 	( frame addr n)
+			type CR
+			drop
+		THEN
 	THEN
-	drop
 ;
+
+\ ..............................................................................................................
+\ Frames received from the network are passed up the protocol stack.............................................
 
 : IP.check ( -- protocol)
 \ Check an IP frame.  If the datagram does not meet assumptions or the destination IP does not match the 
@@ -577,10 +580,11 @@ variable UDPsrcPort					\ Source port of outgoing UDP frames
 
 : EthernetReceiveTask ( --)
 \ super-loop running as a separate task that handles incoming frames
+	ARPsemaphore ACQUIRE
+		ARP.initcache
+	ARPsemaphore RELEASE
 	BEGIN
 		inframe getFrame
 		Ethernet.in
 	AGAIN
 ;
-
-

@@ -4,7 +4,7 @@
 \ Hardware specific (VFX stubs).................................................................................
 
 : getFrame ( frame -- ) 
-\ wait for an incoming Ethernet frame and place it into inFrame
+\ wait for an incoming Ethernet frame and copy it to frame
 	drop
 ;
 
