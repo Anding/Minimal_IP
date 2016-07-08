@@ -1,4 +1,4 @@
-# Minimal_IP_stack
+# Minimal_IP
 A minimal UDP/IP stack in FORTH for the N.I.G.E. Machine
 
 The purpose of this package is to support a UDP/IP terminal on the N.I.G.E. Machine via the Nexys4 / Nexys4DDR Ethernet adapter.  However it should be adaptable to other systems.  See the comments in `network.f`
